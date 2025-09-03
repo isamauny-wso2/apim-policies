@@ -5,6 +5,47 @@
 
 set -e  # Exit on any error
 
+# Show help and exit if --help is provided
+show_help() {
+    echo "WSO2 APIM Policy Installation Script"
+    echo "====================================="
+    echo ""
+    echo "This script automatically installs all AI guardrail policies via the Publisher REST API"
+    echo ""
+    echo "Usage: ./install-policies.sh [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --help    Show this help message and exit"
+    echo ""
+    echo "Password Authentication Options:"
+    echo "  1. Interactive prompt (most secure - default):"
+    echo "     ./install-policies.sh"
+    echo ""
+    echo "  2. Password file (secure):"
+    echo "     echo 'your-password' > ~/.wso2-admin-pass"
+    echo "     chmod 600 ~/.wso2-admin-pass"
+    echo "     export ADMIN_PASS_FILE=~/.wso2-admin-pass"
+    echo "     ./install-policies.sh"
+    echo ""
+    echo "  3. Environment variable (less secure):"
+    echo "     export ADMIN_PASS=your-password"
+    echo "     ./install-policies.sh"
+    echo ""
+    echo "Configuration Options (via environment variables):"
+    echo "  APIM_HOST     - WSO2 APIM hostname (default: localhost)"
+    echo "  APIM_PORT     - WSO2 APIM port (default: 9443)"
+    echo "  ADMIN_USER    - Admin username (default: admin)"
+    echo "  ADMIN_PASS    - Admin password (not recommended for security)"
+    echo "  ADMIN_PASS_FILE - Path to file containing admin password"
+    echo ""
+    exit 0
+}
+
+# Check for --help argument
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    show_help
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -287,8 +328,11 @@ deploy_policy() {
         fi
         return 0
     elif [ "$HTTP_STATUS" -eq 500 ] && echo "$RESPONSE_BODY" | grep -q "Existing common operation policy found for the same name"; then
-        log_warning "  ⚠ Policy already exists (HTTP 500 - duplicate policy name)"
-        return 0
+        log_success "  ✓ Policy already exists (skipped duplicate)"
+        return 2  # Return 2 to indicate already installed
+    elif [ "$HTTP_STATUS" -eq 409 ]; then
+        log_success "  ✓ Policy already exists (conflict - skipped duplicate)"
+        return 2  # Return 2 to indicate already installed
     else
         log_error "  ✗ Failed to deploy policy (HTTP $HTTP_STATUS)"
         log_info "  Response: $RESPONSE_BODY"
@@ -369,6 +413,7 @@ mkdir -p "$TEMP_EXTRACT_DIR"
 
 # Installation statistics
 SUCCESSFUL_INSTALLS=0
+ALREADY_INSTALLED=0
 FAILED_INSTALLS=0
 TOTAL_POLICIES=${#DISTRIBUTION_ZIPS[@]}
 
@@ -391,11 +436,18 @@ for zip_file in "${DISTRIBUTION_ZIPS[@]}"; do
         log_success "  ✓ Policy files extracted successfully"
         
         # Deploy the policy
-        if deploy_policy "$policy_name" "$policy_extract_dir" "$ACCESS_TOKEN"; then
-            ((SUCCESSFUL_INSTALLS++))
-        else
-            ((FAILED_INSTALLS++))
-        fi
+        deploy_policy "$policy_name" "$policy_extract_dir" "$ACCESS_TOKEN" || deploy_result=$?
+        case ${deploy_result:-0} in
+            0)
+                ((SUCCESSFUL_INSTALLS++))
+                ;;
+            2)
+                ((ALREADY_INSTALLED++))
+                ;;
+            *)
+                ((FAILED_INSTALLS++))
+                ;;
+        esac
     else
         log_error "  ✗ Failed to extract policy files"
         ((FAILED_INSTALLS++))
@@ -414,42 +466,25 @@ echo "============================================"
 log_header "Installation Summary:"
 log_info "Total policies: $TOTAL_POLICIES"
 
+if [ $SUCCESSFUL_INSTALLS -gt 0 ]; then
+    log_success "Newly installed: $SUCCESSFUL_INSTALLS"
+fi
+
+if [ $ALREADY_INSTALLED -gt 0 ]; then
+    log_success "Already installed: $ALREADY_INSTALLED"
+fi
+
 if [ $FAILED_INSTALLS -gt 0 ]; then
-    log_success "Successful: $SUCCESSFUL_INSTALLS"
     log_error "Failed: $FAILED_INSTALLS"
 else
-    log_success "Successful: $SUCCESSFUL_INSTALLS"
     log_success "Failed: $FAILED_INSTALLS"
 fi
 
 echo ""
-log_info "Installation log available at: $INSTALL_LOG"
+log_info "Installation log available at: $INSTALL_LOG."
 
-# Usage information
+log_info "For more usage options, run: ./install-policies.sh --help"
 echo ""
-log_info "To verify policy installation, visit:"
-log_info "  https://$APIM_HOST:$APIM_PORT/publisher"
-log_info "  Navigate to: Policies → Operation Policies of any AI/LLM API"
-
-echo ""
-log_info "Password Authentication Options:"
-log_info "  1. Interactive prompt (most secure - default):"
-log_info "     ./install-policies.sh"
-log_info ""
-log_info "  2. Password file (secure):"
-log_info "     echo 'your-password' > ~/.wso2-admin-pass"
-log_info "     chmod 600 ~/.wso2-admin-pass"
-log_info "     export ADMIN_PASS_FILE=~/.wso2-admin-pass"
-log_info "     ./install-policies.sh"
-log_info ""
-log_info "  3. Environment variable (less secure):"
-log_info "     export ADMIN_PASS=your-password"
-log_info "     ./install-policies.sh"
-log_info ""
-log_info "Other Configuration:"
-log_info "  export APIM_HOST=your-apim-host"
-log_info "  export APIM_PORT=9443"
-log_info "  export ADMIN_USER=admin"
 
 # Final timestamp
 echo "" >> "$INSTALL_LOG"
@@ -464,5 +499,10 @@ if [ $FAILED_INSTALLS -gt 0 ]; then
     exit 1
 else
     log_success "All policies installed successfully!"
+    echo ""
+    log_info "You can verify the installation by connecting to:"
+    log_info "  https://$APIM_HOST:$APIM_PORT/publisher"
+    log_info "  Navigate to: Policies → Operation Policies of any AI/LLM API"
+    echo ""
     exit 0
 fi
