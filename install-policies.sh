@@ -15,7 +15,9 @@ show_help() {
     echo "Usage: ./install-policies.sh [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --help    Show this help message and exit"
+    echo "  --help              Show this help message and exit"
+    echo "  --from-folder PATH  Deploy all ZIP files from the specified folder"
+    echo "                      (default: searches mediation/ai directory structure)"
     echo ""
     echo "Password Authentication Options:"
     echo "  1. Interactive prompt (most secure - default):"
@@ -38,13 +40,38 @@ show_help() {
     echo "  ADMIN_PASS    - Admin password (not recommended for security)"
     echo "  ADMIN_PASS_FILE - Path to file containing admin password"
     echo ""
+    echo "Examples:"
+    echo "  # Deploy policies from default location (project structure)"
+    echo "  ./install-policies.sh"
+    echo ""
+    echo "  # Deploy all ZIP files from a custom folder"
+    echo "  ./install-policies.sh --from-folder /path/to/policy-zips"
+    echo ""
     exit 0
 }
 
-# Check for --help argument
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-    show_help
-fi
+# Parse command line arguments
+CUSTOM_FOLDER=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --help|-h)
+            show_help
+            ;;
+        --from-folder)
+            if [ -z "$2" ] || [[ "$2" == -* ]]; then
+                echo "Error: --from-folder requires a folder path argument"
+                exit 1
+            fi
+            CUSTOM_FOLDER="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
 
 # Colors for output
 RED='\033[0;31m'
@@ -60,9 +87,9 @@ BUILD_OUTPUT_DIR="$PROJECT_ROOT/build-output"
 INSTALL_LOG="$BUILD_OUTPUT_DIR/install.log"
 
 # Configuration (can be overridden by environment variables)
-APIM_HOST="${APIM_HOST:-localhost}"
-APIM_PORT="${APIM_PORT:-9443}"
-ADMIN_USER="${ADMIN_USER:-admin}"
+APIM_HOST="${APIM_HOST:-apim-next.apis.coach}"
+APIM_PORT="${APIM_PORT:-9450}"
+ADMIN_USER="${ADMIN_USER:-wso2admin}"
 
 # Set curl options based on hostname
 if [ "$APIM_HOST" = "localhost" ] || [ "$APIM_HOST" = "127.0.0.1" ]; then
@@ -344,29 +371,47 @@ deploy_policy() {
 extract_policy_files() {
     local zip_file="$1"
     local extract_dir="$2"
-    
+
     log_info "Extracting policy files from: $(basename "$zip_file")"
-    
+
     # Create extraction directory
     mkdir -p "$extract_dir"
-    
-    # Special case for azure-content-safety-guardrail which has files in content-moderation subdirectory
-    if [[ "$(basename "$zip_file")" == *"azure-content-safety-guardrail"* ]]; then
+
+    # Try standard extraction first (files at root level)
+    if unzip -j -o "$zip_file" "policy-definition.json" "artifact.j2" -d "$extract_dir" >> "$INSTALL_LOG" 2>&1; then
+        return 0
+    fi
+
+    # If standard extraction failed, try common subdirectory patterns
+    # Special case for content-safety-guardrail which has files in content-moderation subdirectory
+    if [[ "$(basename "$zip_file")" == *"content-safety-guardrail"* ]]; then
         if unzip -j -o "$zip_file" "content-moderation/policy-definition.json" "content-moderation/artifact.j2" -d "$extract_dir" >> "$INSTALL_LOG" 2>&1; then
             return 0
-        else
-            log_error "Failed to extract azure-content-safety-guardrail files from content-moderation subdirectory"
-            return 1
-        fi
-    else
-        # Standard extraction for other policies
-        if unzip -j -o "$zip_file" "policy-definition.json" "artifact.j2" -d "$extract_dir" >> "$INSTALL_LOG" 2>&1; then
-            return 0
-        else
-            log_error "Failed to extract policy files from ZIP"
-            return 1
         fi
     fi
+
+    # Try to find the files in any subdirectory
+    log_info "Attempting to locate policy files in subdirectories..."
+    local temp_extract="$extract_dir/temp_full_extract"
+    mkdir -p "$temp_extract"
+
+    if unzip -o "$zip_file" -d "$temp_extract" >> "$INSTALL_LOG" 2>&1; then
+        # Search for policy-definition.json and artifact.j2
+        local policy_def=$(find "$temp_extract" -name "policy-definition.json" -type f | head -1)
+        local artifact=$(find "$temp_extract" -name "artifact.j2" -type f | head -1)
+
+        if [ -n "$policy_def" ] && [ -n "$artifact" ]; then
+            cp "$policy_def" "$extract_dir/"
+            cp "$artifact" "$extract_dir/"
+            rm -rf "$temp_extract"
+            log_info "Found policy files in subdirectory"
+            return 0
+        fi
+        rm -rf "$temp_extract"
+    fi
+
+    log_error "Failed to extract policy files from ZIP"
+    return 1
 }
 
 # Main policy installation process
@@ -395,13 +440,34 @@ log_success "✓ Access token obtained successfully"
 echo ""
 
 # Find all distribution ZIP files
-log_info "Searching for policy distribution ZIP files..."
-DISTRIBUTION_ZIPS=($(find "$PROJECT_ROOT/mediation/ai" -name "*-distribution.zip" -type f))
+if [ -n "$CUSTOM_FOLDER" ]; then
+    # Use custom folder provided by user
+    log_info "Using custom folder for ZIP files: $CUSTOM_FOLDER"
 
-if [ ${#DISTRIBUTION_ZIPS[@]} -eq 0 ]; then
-    log_error "No distribution ZIP files found. Please run the build script first:"
-    log_info "  ./build-all-policies.sh"
-    exit 1
+    # Validate folder exists
+    if [ ! -d "$CUSTOM_FOLDER" ]; then
+        log_error "Specified folder does not exist: $CUSTOM_FOLDER"
+        exit 1
+    fi
+
+    # Find all ZIP files in the custom folder (non-recursive)
+    log_info "Searching for ZIP files in: $CUSTOM_FOLDER"
+    DISTRIBUTION_ZIPS=($(find "$CUSTOM_FOLDER" -maxdepth 1 -name "*.zip" -type f))
+
+    if [ ${#DISTRIBUTION_ZIPS[@]} -eq 0 ]; then
+        log_error "No ZIP files found in folder: $CUSTOM_FOLDER"
+        exit 1
+    fi
+else
+    # Use default search in project structure
+    log_info "Searching for policy distribution ZIP files in project structure..."
+    DISTRIBUTION_ZIPS=($(find "$PROJECT_ROOT/mediation/ai" -name "*-distribution.zip" -type f))
+
+    if [ ${#DISTRIBUTION_ZIPS[@]} -eq 0 ]; then
+        log_error "No distribution ZIP files found. Please run the build script first:"
+        log_info "  ./build-all-policies.sh"
+        exit 1
+    fi
 fi
 
 log_info "Found ${#DISTRIBUTION_ZIPS[@]} distribution ZIP files"
@@ -423,9 +489,25 @@ echo ""
 # Process each distribution ZIP
 for zip_file in "${DISTRIBUTION_ZIPS[@]}"; do
     # Extract policy name from ZIP file path
-    # Path format: .../mediation/ai/{policy-name}/universal-gw/{policy-name}/target/{policy-name}-distribution.zip
-    policy_name=$(echo "$zip_file" | sed 's|.*/mediation/ai/\([^/]*\)/.*|\1|')
-    
+    if [ -n "$CUSTOM_FOLDER" ]; then
+        # For custom folder, extract from filename
+        filename=$(basename "$zip_file" .zip)
+
+        # Extract policy name from package-style naming
+        # Pattern: org.wso2.[am|apim].policies.mediation.ai.{policy-name}-guardrailsai-{version}-distribution
+        # or simpler names like: {policy-name}-distribution
+        if [[ "$filename" == org.wso2.* ]]; then
+            # Remove package prefix and everything after -guardrailsai
+            policy_name=$(echo "$filename" | sed -E 's/^org\.wso2\.(am|apim)\.policies\.mediation\.ai\.//' | sed -E 's/-guardrailsai.*//')
+        else
+            # Simple format: remove -distribution suffix and version numbers
+            policy_name=$(echo "$filename" | sed -E 's/-distribution$//' | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+.*$//')
+        fi
+    else
+        # For default structure: .../mediation/ai/{policy-name}/universal-gw/{policy-name}/target/{policy-name}-distribution.zip
+        policy_name=$(echo "$zip_file" | sed 's|.*/mediation/ai/\([^/]*\)/.*|\1|')
+    fi
+
     log_header "Processing: $policy_name"
     
     # Create extraction directory for this policy
